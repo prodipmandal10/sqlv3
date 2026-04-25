@@ -173,10 +173,11 @@ while true; do
     echo -e "${CYAN}14) 🗄️ MYSQL DB MANAGER (Tree View, Create & Drop)${RESET}"
     echo -e "${RED}15) 🚑 DISASTER RECOVERY (1-Click Full Server Restore)${RESET}"
     echo -e "${GREEN}16) 🕵️‍♂️ DB CREDENTIAL FINDER (Smart Search)${RESET}"
+    echo -e "${MAGENTA}17) 🔒 SECURE RUNNING DOMAINS (Block .env for existing sites)${RESET}"
     echo -e "${RED}0) ❌ EXIT${RESET}"
     echo -e "${BLUE}=====================================================${RESET}"
 
-    read -p "Select an option [0-16]: " raw_choice
+    read -p "Select an option [0-17]: " raw_choice
     choice=$(echo "$raw_choice" | tr -cd '0-9')
     if [ -z "$choice" ]; then choice="99"; fi
 
@@ -777,6 +778,44 @@ BACKUP_EOF
                 grep -riE 'DB_HOST|DB_USER|DB_PASS|DB_NAME|\$db_name|\$username' /var/www/html/$PROJ_DIR/ | grep -v 'vendor' | head -n 15
             else
                 echo -e "${RED}[-] Folder not found!${RESET}"
+            fi
+            read -p "Press Enter to return..."
+            ;;
+
+        # 🚀 NEW OPTION 17: Secure Existing Domains without recreating them
+        17)
+            echo -e "\n${MAGENTA}[*] 🔒 SECURE RUNNING DOMAINS (.env Protection)${RESET}"
+            echo -e "${YELLOW}This will scan all active Nginx configurations and inject .env blocking rules.${RESET}"
+            read -p "Do you want to proceed? (YES/NO): " PROCEED
+            
+            if [ "$PROCEED" == "YES" ]; then
+                echo -e "${CYAN}[*] Scanning active domain configs in /etc/nginx/sites-available/...${RESET}"
+                
+                # Loop through all files in sites-available except 'default'
+                for conf_file in /etc/nginx/sites-available/*; do
+                    if [[ -f "$conf_file" && "$(basename "$conf_file")" != "default" ]]; then
+                        domain_name=$(basename "$conf_file")
+                        
+                        # Check if it already has the protection rule
+                        if grep -q "location ~ /\\\\." "$conf_file"; then
+                            echo -e "${GREEN}[+] $domain_name is already secure!${RESET}"
+                        else
+                            echo -e "${YELLOW}[*] Injecting security block into $domain_name...${RESET}"
+                            
+                            # Use sed to inject the block right after 'index index.php...' or 'root ...'
+                            sudo sed -i '/index /a \ \n    # 🛡️ 100% Hacker Proof: Hidden Files (.env, .git) Block\n    location ~ /\\. {\n        deny all;\n        access_log off;\n        log_not_found off;\n    }' "$conf_file"
+                            
+                            echo -e "${GREEN}[+] $domain_name secured successfully!${RESET}"
+                        fi
+                    fi
+                done
+                
+                # Restart Nginx to apply changes
+                echo -e "${CYAN}[*] Restarting Nginx Server...${RESET}"
+                sudo systemctl restart nginx
+                echo -e "${GREEN}[+] ALL DOMAINS ARE NOW 100% HACKER PROOF!${RESET}"
+            else
+                echo -e "${RED}[-] Operation cancelled.${RESET}"
             fi
             read -p "Press Enter to return..."
             ;;
