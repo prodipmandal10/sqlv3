@@ -173,7 +173,7 @@ while true; do
     echo -e "${CYAN}14) 🗄️ MYSQL DB MANAGER (Tree View, Create & Drop)${RESET}"
     echo -e "${RED}15) 🚑 DISASTER RECOVERY (1-Click Full Server Restore)${RESET}"
     echo -e "${GREEN}16) 🕵️‍♂️ DB CREDENTIAL FINDER (Smart Search)${RESET}"
-    echo -e "${MAGENTA}17) 🔒 SECURE RUNNING DOMAINS (Block .env for existing sites)${RESET}"
+    echo -e "${MAGENTA}17) 🔒 SECURE A DOMAIN (.env block per domain)${RESET}"
     echo -e "${RED}0) ❌ EXIT${RESET}"
     echo -e "${BLUE}=====================================================${RESET}"
 
@@ -221,7 +221,6 @@ while true; do
                 CONF_FILE="/etc/nginx/sites-available/${DOMAIN_NAME}"
                 PHP_SOCK=$(find /var/run/php/ -name "php*-fpm.sock" | head -n 1)
 
-                # Applying Nginx configuration with .env protection
                 sudo bash -c "cat > $CONF_FILE" <<EOF
 server {
     listen 80;
@@ -258,10 +257,6 @@ EOF
                 sudo systemctl restart nginx
                 echo -e "${GREEN}[+] Domain '${DOMAIN_NAME}' successfully linked to '${PROJ_DIR}'!${RESET}"
                 echo -e "${GREEN}[+] Security: .env files are now blocked and extensionless URLs are active!${RESET}"
-
-                if [[ "$DOMAIN_NAME" == *".local"* || "$DOMAIN_NAME" == *".test"* ]]; then
-                    echo -e "${YELLOW}👉 Remember to add '${DOMAIN_NAME}' to your Windows 'hosts' file!${RESET}"
-                fi
             else
                 echo -e "${RED}[-] Folder not found!${RESET}"
             fi
@@ -334,7 +329,6 @@ EOF
 
                     if [ ! -d "$LINUX_PATH" ]; then
                         echo -e "${RED}[-] Directory not found: $LINUX_PATH${RESET}"
-                        echo -e "${YELLOW}💡 If you are using WSL, make sure the Windows drive is accessible at /mnt/c/ etc.${RESET}"
                         read -p "Press Enter to return..."
                         continue
                     fi
@@ -459,12 +453,10 @@ EOF
             cat << 'BACKUP_EOF' > /root/nightly_master_backup.sh
 #!/bin/bash
 DATE=$(date +"%d-%b-%Y")
-# Backup full server DB separately
 sudo mysqldump --all-databases > /tmp/All_Databases_Nightly_${DATE}.sql
 rclone copy /tmp/All_Databases_Nightly_${DATE}.sql gdrive:Server_Backups/Auto_Nightly/
 rm -f /tmp/All_Databases_Nightly_${DATE}.sql
 
-# Backup files only for each project
 for dir in /var/www/html/*/; do
     PROJ_NAME=$(basename "$dir")
     ZIP_NAME="${PROJ_NAME}_FilesOnly_AutoBackup_${DATE}.zip"
@@ -782,41 +774,57 @@ BACKUP_EOF
             read -p "Press Enter to return..."
             ;;
 
-        # 🚀 NEW OPTION 17: Secure Existing Domains without recreating them
+        # 🚀 NEW OPTION 17: Interactive Domain Selector for .env Protection
         17)
-            echo -e "\n${MAGENTA}[*] 🔒 SECURE RUNNING DOMAINS (.env Protection)${RESET}"
-            echo -e "${YELLOW}This will scan all active Nginx configurations and inject .env blocking rules.${RESET}"
-            read -p "Do you want to proceed? (YES/NO): " PROCEED
+            echo -e "\n${MAGENTA}[*] 🔒 SECURE A DOMAIN (.env Protection)${RESET}"
+            echo -e "${YELLOW}Available Domain Configurations:${RESET}"
             
-            if [ "$PROCEED" == "YES" ]; then
-                echo -e "${CYAN}[*] Scanning active domain configs in /etc/nginx/sites-available/...${RESET}"
-                
-                # Loop through all files in sites-available except 'default'
-                for conf_file in /etc/nginx/sites-available/*; do
-                    if [[ -f "$conf_file" && "$(basename "$conf_file")" != "default" ]]; then
-                        domain_name=$(basename "$conf_file")
-                        
-                        # Check if it already has the protection rule
-                        if grep -q "location ~ /\\\\." "$conf_file"; then
-                            echo -e "${GREEN}[+] $domain_name is already secure!${RESET}"
-                        else
-                            echo -e "${YELLOW}[*] Injecting security block into $domain_name...${RESET}"
-                            
-                            # Use sed to inject the block right after 'index index.php...' or 'root ...'
-                            sudo sed -i '/index /a \ \n    # 🛡️ 100% Hacker Proof: Hidden Files (.env, .git) Block\n    location ~ /\\. {\n        deny all;\n        access_log off;\n        log_not_found off;\n    }' "$conf_file"
-                            
-                            echo -e "${GREEN}[+] $domain_name secured successfully!${RESET}"
-                        fi
-                    fi
-                done
-                
-                # Restart Nginx to apply changes
-                echo -e "${CYAN}[*] Restarting Nginx Server...${RESET}"
-                sudo systemctl restart nginx
-                echo -e "${GREEN}[+] ALL DOMAINS ARE NOW 100% HACKER PROOF!${RESET}"
-            else
-                echo -e "${RED}[-] Operation cancelled.${RESET}"
+            declare -a CONF_FILES
+            COUNTER=1
+            
+            # Find all domain configs in Nginx (excluding default)
+            for conf in /etc/nginx/sites-available/*; do
+                if [[ -f "$conf" && "$(basename "$conf")" != "default" ]]; then
+                    CONF_FILES[$COUNTER]="$conf"
+                    echo -e "${CYAN}$COUNTER) 🌐 $(basename "$conf")${RESET}"
+                    ((COUNTER++))
+                fi
+            done
+            
+            if [ $COUNTER -eq 1 ]; then
+                echo -e "${RED}[-] No active domains found!${RESET}"
+                read -p "Press Enter to return..."
+                continue
             fi
+            
+            echo -e "${RED}0) 🔙 Cancel${RESET}"
+            echo -e "${BLUE}-----------------------------------------------------${RESET}"
+            
+            read -p "Select the domain you want to secure [0-$((COUNTER-1))]: " DOM_CHOICE
+            DOM_CHOICE=$(echo "$DOM_CHOICE" | tr -cd '0-9')
+            
+            if [[ "$DOM_CHOICE" == "0" || -z "$DOM_CHOICE" ]]; then
+                continue
+            elif [[ "$DOM_CHOICE" -gt 0 && "$DOM_CHOICE" -lt "$COUNTER" ]]; then
+                TARGET_CONF="${CONF_FILES[$DOM_CHOICE]}"
+                DOMAIN_NAME=$(basename "$TARGET_CONF")
+                
+                # Check if it already has the location ~ /\. block
+                if grep -q "location ~ /\\\\." "$TARGET_CONF"; then
+                    echo -e "\n${GREEN}[+] $DOMAIN_NAME is already secure! .env is blocked.${RESET}"
+                else
+                    echo -e "\n${YELLOW}[*] Injecting security block into $DOMAIN_NAME...${RESET}"
+                    
+                    # Injecting the security rule safely after 'index index.php...'
+                    sudo sed -i '/index /a \ \n    # 🛡️ 100% Hacker Proof: Hidden Files (.env, .git) Block\n    location ~ /\\. {\n        deny all;\n        access_log off;\n        log_not_found off;\n    }' "$TARGET_CONF"
+                    
+                    sudo systemctl restart nginx
+                    echo -e "${GREEN}[+] BOOM! $DOMAIN_NAME is now secured. .env is hidden from hackers!${RESET}"
+                fi
+            else
+                echo -e "${RED}[-] Invalid selection!${RESET}"
+            fi
+            
             read -p "Press Enter to return..."
             ;;
 
