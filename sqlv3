@@ -1,1 +1,785 @@
+#!/bin/bash
 
+# --- 🪄 MAGIC DOS2UNIX AUTO-FIX (Anti-Shake/Blink) ---
+if grep -q $'\r' "$0"; then
+    echo -e "\e[33m[*] Fixing Windows Line Endings automatically...\e[0m"
+    sed -i 's/\r$//' "$0"
+    exec bash "$0" "$@"
+fi
+# ----------------------------------------------------
+
+# Colors for design
+GREEN="\e[32m"
+RED="\e[31m"
+BLUE="\e[34m"
+YELLOW="\e[33m"
+CYAN="\e[36m"
+MAGENTA="\e[35m"
+RESET="\e[0m"
+
+# Auto Install basic requirements silently if missing
+for pkg in unzip zip curl wget rclone python3-pip dos2unix; do
+    if ! command -v $pkg &> /dev/null; then
+        echo -e "${YELLOW}[*] Installing missing package: $pkg...${RESET}"
+        sudo apt-get install $pkg -y > /dev/null 2>&1
+    fi
+done
+
+# Install gdown for flawless Google Drive downloads
+if ! command -v gdown &> /dev/null; then
+    echo -e "${YELLOW}[*] Installing gdown for Google Drive bypass...${RESET}"
+    sudo apt-get install gdown -y > /dev/null 2>&1 || sudo pip3 install gdown --break-system-packages > /dev/null 2>&1 || sudo pip3 install gdown > /dev/null 2>&1
+fi
+
+# ─────────────────────────────────────────────────────────
+# 🔧 SHARED HELPER: Download from GDrive with 3-step fallback
+# Usage: gdrive_download "$FILE_ID" "/tmp/output.zip"
+# Returns 0 on success, 1 on failure
+# ─────────────────────────────────────────────────────────
+gdrive_download() {
+    local FID="$1"
+    local OUT="$2"
+    sudo rm -f "$OUT"
+
+    # ── Step 1: gdown --id (classic)
+    echo -e "${CYAN}[*] Attempt 1: gdown --id ...${RESET}"
+    gdown --id "$FID" -O "$OUT" 2>/dev/null
+    if unzip -t "$OUT" &>/dev/null; then
+        echo -e "${GREEN}[+] Download OK (Step 1)${RESET}"
+        return 0
+    fi
+    sudo rm -f "$OUT"
+
+    # ── Step 2: gdown with full URL (confirmed working by user ✅)
+    echo -e "${YELLOW}[*] Attempt 2: gdown with full URL...${RESET}"
+    gdown "https://drive.google.com/uc?id=$FID" -O "$OUT" 2>/dev/null
+    if unzip -t "$OUT" &>/dev/null; then
+        echo -e "${GREEN}[+] Download OK (Step 2)${RESET}"
+        return 0
+    fi
+    sudo rm -f "$OUT"
+
+    # ── Step 3: wget confirm=t fallback
+    echo -e "${YELLOW}[*] Attempt 3: wget confirm=t fallback...${RESET}"
+    sudo wget -qO "$OUT" "https://docs.google.com/uc?export=download&confirm=t&id=$FID"
+    if unzip -t "$OUT" &>/dev/null; then
+        echo -e "${GREEN}[+] Download OK (Step 3)${RESET}"
+        return 0
+    fi
+    sudo rm -f "$OUT"
+
+    echo -e "${RED}[-] All 3 download attempts failed!${RESET}"
+    return 1
+}
+
+# ─────────────────────────────────────────────────────────
+# 🔧 SHARED HELPER: Process ZIP → Extract + DB Restore
+# Usage: process_project_zip "/tmp/file.zip" "folder_name"
+# ─────────────────────────────────────────────────────────
+process_project_zip() {
+    local ZIP_PATH="$1"
+    local NEW_DIR="$2"
+
+    echo -e "${GREEN}[*] Extracting ZIP file...${RESET}"
+    sudo mkdir -p /var/www/html/$NEW_DIR
+    sudo unzip -q -o "$ZIP_PATH" -d /var/www/html/$NEW_DIR
+    sudo rm -f "$ZIP_PATH"
+
+    sudo chown -R $USER:www-data /var/www/html/$NEW_DIR
+    sudo chmod -R 775 /var/www/html/$NEW_DIR
+
+    if [ -f "/var/www/html/$NEW_DIR/database_backup.sql" ]; then
+        echo -e "\n${YELLOW}[*] SQL file found! Scanning for DB Name...${RESET}"
+        DETECTED_DB=""
+        FOUND_FILES=$(find /var/www/html/$NEW_DIR -type f \( -name "*.php" -o -name "*.env" \) 2>/dev/null)
+        if [ -n "$FOUND_FILES" ]; then
+            while IFS= read -r FILE; do
+                TEMP_DB=$(grep -iP '^\s*\$(dbname|db_name|database|db)\s*=\s*' "$FILE" | grep -oP "(?<=[\"'])[^\"']+(?=[\"'])" | grep -v "^$" | tail -1)
+                [ -z "$TEMP_DB" ] && TEMP_DB=$(grep -iP "define\s*\(\s*[\"']DB_NAME[\"']" "$FILE" | grep -oP "(?<=[\"'])[^\"']+(?=[\"'])" | tail -1)
+                [ -z "$TEMP_DB" ] && TEMP_DB=$(grep -iE "^DB_NAME\s*=|^DB_DATABASE\s*=" "$FILE" | cut -d'=' -f2 | tr -d "\"' " | tail -1)
+                if [ -z "$TEMP_DB" ]; then
+                    MYSQLI_LINE=$(grep -iP 'new\s+mysqli\s*\(' "$FILE" | grep -v '\$' | head -1)
+                    if [ -n "$MYSQLI_LINE" ]; then
+                        ARGS=$(echo "$MYSQLI_LINE" | grep -oP "(?<=mysqli\()[^)]+")
+                        TEMP_DB=$(echo "$ARGS" | awk -F',' '{print $4}' | tr -d ' "'"'"'')
+                    fi
+                fi
+                if [ -n "$TEMP_DB" ]; then DETECTED_DB="$TEMP_DB"; break; fi
+            done <<< "$FOUND_FILES"
+        fi
+
+        if [ -n "$DETECTED_DB" ]; then
+            echo -e "${GREEN}[+] Detected SaaS Database: ${CYAN}$DETECTED_DB${RESET}"
+            read -p "Press Enter to use '$DETECTED_DB' OR type a new name: " NEW_DB_NAME
+            [ -z "$NEW_DB_NAME" ] && NEW_DB_NAME="$DETECTED_DB"
+        else
+            read -p "Could not auto-detect. Enter a Database Name: " NEW_DB_NAME
+        fi
+
+        echo -e "${GREEN}[*] Creating Database & Applying fixes...${RESET}"
+        sudo mysql -e "CREATE DATABASE IF NOT EXISTS \`$NEW_DB_NAME\`;"
+        sudo mysql -e "GRANT ALL PRIVILEGES ON \`$NEW_DB_NAME\`.* TO 'admin'@'localhost'; FLUSH PRIVILEGES;"
+
+        sudo sed -i '/^\/\*/s/DEFINER=[^*]*\*/\*/g' "/var/www/html/$NEW_DIR/database_backup.sql"
+        sudo sed -i '/^CREATE/s/DEFINER=[^ ]* //g' "/var/www/html/$NEW_DIR/database_backup.sql"
+        sudo sed -i '/^CREATE/s/DEFINER=\`[^\`]*\`@\`[^\`]*\` //g' "/var/www/html/$NEW_DIR/database_backup.sql"
+
+        echo -e "${GREEN}[*] Restoring Database...${RESET}"
+        sudo mysql "$NEW_DB_NAME" < "/var/www/html/$NEW_DIR/database_backup.sql"
+        if [ $? -eq 0 ]; then
+            echo -e "${GREEN}[+] Database '$NEW_DB_NAME' Restored Successfully!${RESET}"
+            sudo rm -f "/var/www/html/$NEW_DIR/database_backup.sql"
+        else
+            echo -e "${RED}[-] Error restoring DB. Check SQL file.${RESET}"
+        fi
+    fi
+
+    echo -e "${GREEN}[+] SaaS Installed! Link: http://YOUR_IP/$NEW_DIR ${RESET}"
+}
+
+# ─────────────────────────────────────────────────────────
+# 🔧 SHARED HELPER: Convert Windows path → Linux/WSL path
+# ─────────────────────────────────────────────────────────
+win_to_linux_path() {
+    local RAW="$1"
+    RAW=$(echo "$RAW" | tr -d '"'"'")
+    RAW=$(echo "$RAW" | sed 's|\\|/|g')
+    if echo "$RAW" | grep -qP '^[A-Za-z]:'; then
+        local DRIVE=$(echo "$RAW" | cut -c1 | tr '[:upper:]' '[:lower:]')
+        RAW="/mnt/$DRIVE$(echo "$RAW" | cut -c3-)"
+    fi
+    echo "$RAW"
+}
+
+
+# ═══════════════════════════════════════════════════════
+#                    MAIN LOOP
+# ═══════════════════════════════════════════════════════
+while true; do
+    clear
+    echo -e "${YELLOW}=====================================================${RESET}"
+    echo -e "${MAGENTA}             👑 MADE BY PRODIP 👑               ${RESET}"
+    echo -e "${YELLOW}=====================================================${RESET}"
+    echo -e "${GREEN}    🌟 SAAS SERVER MANAGEMENT MASTER (NGINX PRO) 🌟    ${RESET}"
+    echo -e "${BLUE}=====================================================${RESET}"
+    echo -e "${CYAN}1) 🛠️ INITIAL SETUP (Auto Fix Nginx & Remove Apache)${RESET}"
+    echo -e "${CYAN}2) 🌐 SETUP DOMAIN (Supports Multiple Websites)${RESET}"
+    echo -e "${CYAN}3) 📊 SERVER HEALTH CHECK (Live Status)${RESET}"
+    echo -e "${BLUE}-----------------------------------------------------${RESET}"
+    echo -e "${CYAN}4) 📂 SHOW ALL PROJECTS (Running Websites)${RESET}"
+    echo -e "${CYAN}5) 🚀 INSTALL SAAS PROJECT (Auto DB Detect & Restore)${RESET}"
+    echo -e "${CYAN}6) 💾 BACKUP A SPECIFIC PROJECT (To GDrive)${RESET}"
+    echo -e "${RED}7) 🗑️ DELETE A PROJECT (Remove Website)${RESET}"
+    echo -e "${YELLOW}8) ⚙️ INSTALL & SETUP RCLONE (Auto)${RESET}"
+    echo -e "${CYAN}9) 🛡️ ADD SECURITY (Auto Update & Firewall)${RESET}"
+    echo -e "${YELLOW}10) ⏰ SET AUTO NIGHTLY BACKUP (11:00 PM)${RESET}"
+    echo -e "${GREEN}11) 🔒 AUTO SSL (HTTPS) SETUP (Certbot)${RESET}"
+    echo -e "${MAGENTA}12) 🔑 CHANGE DB ADMIN PASSWORD (Live)${RESET}"
+    echo -e "${YELLOW}13) 📝 FILE EXPLORER & EDITOR (Live Code Edit)${RESET}"
+    echo -e "${CYAN}14) 🗄️ MYSQL DB MANAGER (Tree View, Create & Drop)${RESET}"
+    echo -e "${RED}15) 🚑 DISASTER RECOVERY (1-Click Full Server Restore)${RESET}"
+    echo -e "${GREEN}16) 🕵️‍♂️ DB CREDENTIAL FINDER (Smart Search)${RESET}"
+    echo -e "${RED}0) ❌ EXIT${RESET}"
+    echo -e "${BLUE}=====================================================${RESET}"
+
+    read -p "Select an option [0-16]: " raw_choice
+    choice=$(echo "$raw_choice" | tr -cd '0-9')
+    if [ -z "$choice" ]; then choice="99"; fi
+
+    case $choice in
+        1)
+            echo -e "\n${YELLOW}[*] INITIAL SERVER SETUP (Auto Config & Cleaning)...${RESET}"
+            echo -e "${CYAN}[*] Stopping and removing Apache2 if it exists...${RESET}"
+            sudo systemctl stop apache2 2>/dev/null
+            sudo systemctl disable apache2 2>/dev/null
+            sudo apt-get purge apache2 apache2-utils apache2-bin apache2.2-common -y > /dev/null 2>&1
+            sudo apt-get autoremove -y > /dev/null 2>&1
+
+            sudo apt update -y
+            sudo apt install nginx mysql-server php php-fpm php-mysql zip unzip curl wget -y
+            sudo mysql -e "CREATE USER IF NOT EXISTS 'admin'@'localhost' IDENTIFIED WITH mysql_native_password BY '12345'; GRANT ALL PRIVILEGES ON *.* TO 'admin'@'localhost' WITH GRANT OPTION; FLUSH PRIVILEGES;"
+
+            sudo usermod -aG www-data $USER
+            sudo chown -R $USER:www-data /var/www/html/
+            sudo chmod -R 775 /var/www/html/
+
+            echo -e "${CYAN}[*] Applying Nginx Auto-Fix (Removing default config)...${RESET}"
+            sudo rm -f /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default
+
+            sudo systemctl enable nginx
+            sudo systemctl restart nginx
+            echo -e "${GREEN}[+] Setup Complete! Server is Pure Nginx & Permissions Fixed.${RESET}"
+            read -p "Press Enter to return..."
+            ;;
+
+        2)
+            echo -e "\n${YELLOW}[*] SETUP DOMAIN (Link Domain to Project)${RESET}"
+            ls -d /var/www/html/*/ | awk -F/ '{print "- " $(NF-1)}' 2>/dev/null || echo "No projects found!"
+            read -p "Enter the project folder name (e.g. codexaum): " PROJ_DIR
+
+            if [ -d "/var/www/html/$PROJ_DIR" ]; then
+                echo -e "${CYAN}💡 TIP FOR MULTIPLE LOCAL SITES: Use names like 'site1.local' or 'codexaum.local'${RESET}"
+                read -p "Enter your Domain Name (e.g. codexaum.local): " DOMAIN_NAME
+                DOMAIN_NAME=$(echo "$DOMAIN_NAME" | tr -d ' ')
+
+                CONF_FILE="/etc/nginx/sites-available/${DOMAIN_NAME}"
+                PHP_SOCK=$(find /var/run/php/ -name "php*-fpm.sock" | head -n 1)
+
+                sudo bash -c "cat > $CONF_FILE" <<EOF
+server {
+    listen 80;
+    server_name $DOMAIN_NAME www.$DOMAIN_NAME;
+    root /var/www/html/$PROJ_DIR;
+    index index.php index.html;
+
+    location / {
+        try_files \$uri \$uri/ /index.php?\$query_string;
+    }
+
+    location ~ \.php$ {
+        include snippets/fastcgi-php.conf;
+        fastcgi_pass unix:$PHP_SOCK;
+    }
+}
+EOF
+                sudo ln -sf /etc/nginx/sites-available/${DOMAIN_NAME} /etc/nginx/sites-enabled/
+                sudo systemctl restart nginx
+                echo -e "${GREEN}[+] Domain '${DOMAIN_NAME}' successfully linked to '${PROJ_DIR}'!${RESET}"
+
+                if [[ "$DOMAIN_NAME" == *".local"* || "$DOMAIN_NAME" == *".test"* ]]; then
+                    echo -e "${YELLOW}👉 Remember to add '${DOMAIN_NAME}' to your Windows 'hosts' file!${RESET}"
+                fi
+            else
+                echo -e "${RED}[-] Folder not found!${RESET}"
+            fi
+            read -p "Press Enter to return..."
+            ;;
+
+        3)
+            echo -e "\n${YELLOW}[*] SERVER HEALTH CHECK (Live Status)${RESET}"
+            systemctl is-active --quiet nginx && echo -e "🌐 Web Server (Nginx) : ${GREEN}🟢 RUNNING${RESET}" || echo -e "🌐 Web Server (Nginx) : ${RED}🔴 STOPPED${RESET}"
+            systemctl is-active --quiet mysql && echo -e "🗄️ Database (MySQL)   : ${GREEN}🟢 RUNNING${RESET}" || echo -e "🗄️ Database (MySQL)   : ${RED}🔴 STOPPED${RESET}"
+            uptime -p
+            read -p "Press Enter to return..."
+            ;;
+
+        4)
+            echo -e "\n${YELLOW}[*] Scanning Server for Projects...${RESET}"
+            ls -d /var/www/html/*/ | awk -F/ '{print "👉 " $(NF-1)}' 2>/dev/null || echo "No projects found."
+            read -p "Press Enter to return..."
+            ;;
+
+        5)
+            echo -e "\n${YELLOW}=====================================================${RESET}"
+            echo -e "${GREEN}    🚀 INSTALL SAAS PROJECT${RESET}"
+            echo -e "${YELLOW}=====================================================${RESET}"
+            echo -e "${CYAN}1) 🌐 Auto Download from Google Drive${RESET}"
+            echo -e "${MAGENTA}2) 📁 Manual Restore from Local Path (Windows/Linux)${RESET}"
+            echo -e "${RED}0) 🔙 Go Back${RESET}"
+            echo -e "${YELLOW}=====================================================${RESET}"
+            read -p "Select method [0-2]: " INST_METHOD
+            INST_METHOD=$(echo "$INST_METHOD" | tr -cd '0-9')
+
+            case $INST_METHOD in
+                1)
+                    echo -e "\n${CYAN}[*] Enter Google Drive Share Link (ZIP File):${RESET}"
+                    read -p "Link: " LINK
+                    FILE_ID=$(echo "$LINK" | sed -E 's/.*\/d\/([a-zA-Z0-9_-]+).*/\1/')
+
+                    if [ -z "$FILE_ID" ]; then
+                        echo -e "${RED}[-] Invalid Google Drive link! Could not extract File ID.${RESET}"
+                        read -p "Press Enter to return..."
+                        continue
+                    fi
+
+                    read -p "Enter NEW folder name for this SaaS project: " NEW_DIR
+                    NEW_DIR=$(echo "$NEW_DIR" | tr -d ' ')
+
+                    gdrive_download "$FILE_ID" "/tmp/temp_proj.zip"
+                    if [ $? -ne 0 ]; then
+                        echo -e "${RED}[-] Download failed after 3 attempts. Make sure the Drive link is set to 'Anyone with the link'.${RESET}"
+                        read -p "Press Enter to return..."
+                        continue
+                    fi
+
+                    process_project_zip "/tmp/temp_proj.zip" "$NEW_DIR"
+                    ;;
+
+                2)
+                    echo -e "\n${MAGENTA}=====================================================${RESET}"
+                    echo -e "${GREEN}  📁 MANUAL RESTORE FROM LOCAL PATH${RESET}"
+                    echo -e "${MAGENTA}=====================================================${RESET}"
+                    echo -e "${CYAN}💡 Paste your Windows OR Linux folder path below.${RESET}"
+                    echo -e "${YELLOW}   Windows example: C:\\Users\\RABI\\Desktop\\school${RESET}"
+                    echo -e "${YELLOW}   Linux example  : /home/rabi/Desktop/school${RESET}"
+                    echo -e "${CYAN}   The script will auto-find the ZIP inside the folder.${RESET}"
+                    echo -e "${MAGENTA}=====================================================${RESET}"
+                    read -p "Paste Path: " RAW_PATH
+
+                    LINUX_PATH=$(win_to_linux_path "$RAW_PATH")
+                    echo -e "${CYAN}[*] Resolved Path: ${GREEN}$LINUX_PATH${RESET}"
+
+                    if [ ! -d "$LINUX_PATH" ]; then
+                        echo -e "${RED}[-] Directory not found: $LINUX_PATH${RESET}"
+                        echo -e "${YELLOW}💡 If you are using WSL, make sure the Windows drive is accessible at /mnt/c/ etc.${RESET}"
+                        read -p "Press Enter to return..."
+                        continue
+                    fi
+
+                    mapfile -t ZIP_FILES < <(find "$LINUX_PATH" -maxdepth 1 -name "*.zip" 2>/dev/null)
+
+                    if [ ${#ZIP_FILES[@]} -eq 0 ]; then
+                        echo -e "${RED}[-] No ZIP files found in: $LINUX_PATH${RESET}"
+                        read -p "Press Enter to return..."
+                        continue
+                    elif [ ${#ZIP_FILES[@]} -eq 1 ]; then
+                        SELECTED_ZIP="${ZIP_FILES[0]}"
+                        echo -e "${GREEN}[+] Found ZIP: $(basename "$SELECTED_ZIP")${RESET}"
+                    else
+                        echo -e "${YELLOW}[*] Multiple ZIP files found. Select one:${RESET}"
+                        for idx in "${!ZIP_FILES[@]}"; do
+                            echo -e "${CYAN}$((idx+1))) $(basename "${ZIP_FILES[$idx]}")${RESET}"
+                        done
+                        read -p "Select ZIP [1-${#ZIP_FILES[@]}]: " ZIP_CHOICE
+                        ZIP_CHOICE=$(echo "$ZIP_CHOICE" | tr -cd '0-9')
+                        if [[ -z "$ZIP_CHOICE" || "$ZIP_CHOICE" -lt 1 || "$ZIP_CHOICE" -gt ${#ZIP_FILES[@]} ]]; then
+                            echo -e "${RED}[-] Invalid selection. Cancelled.${RESET}"
+                            read -p "Press Enter to return..."
+                            continue
+                        fi
+                        SELECTED_ZIP="${ZIP_FILES[$((ZIP_CHOICE-1))]}"
+                    fi
+
+                    if ! unzip -t "$SELECTED_ZIP" &>/dev/null; then
+                        echo -e "${RED}[-] Selected file is not a valid ZIP: $SELECTED_ZIP${RESET}"
+                        read -p "Press Enter to return..."
+                        continue
+                    fi
+
+                    read -p "Enter NEW folder name for this SaaS project: " NEW_DIR
+                    NEW_DIR=$(echo "$NEW_DIR" | tr -d ' ')
+
+                    echo -e "${GREEN}[*] Copying ZIP to temp location...${RESET}"
+                    sudo cp "$SELECTED_ZIP" /tmp/manual_proj.zip
+
+                    process_project_zip "/tmp/manual_proj.zip" "$NEW_DIR"
+                    ;;
+
+                0) continue ;;
+                *) echo -e "${RED}[-] Invalid option.${RESET}"; sleep 1 ;;
+            esac
+
+            read -p "Press Enter to return..."
+            ;;
+
+        # 🚀 FIXED OPTION 6: Specific DB Backup
+        6)
+            echo -e "\n${YELLOW}[*] BACKUP SPECIFIC PROJECT TO GDRIVE${RESET}"
+            ls -d /var/www/html/*/ | awk -F/ '{print "- " $(NF-1)}' 2>/dev/null
+            read -p "Enter project folder: " FOLDER_NAME
+            
+            if [ -d "/var/www/html/$FOLDER_NAME" ]; then
+                read -p "Enter the DATABASE NAME for this project: " PROJ_DB
+                
+                if [ -z "$PROJ_DB" ]; then
+                    echo -e "${RED}[-] Database name cannot be empty! Backup cancelled.${RESET}"
+                    read -p "Press Enter to return..."
+                    continue
+                fi
+
+                DATE=$(date +"%d-%b-%Y_%I-%M-%p")
+                BACKUP_NAME="${FOLDER_NAME}_Backup_$DATE.zip"
+                
+                echo -e "${GREEN}[*] Exporting Database ('$PROJ_DB') and Zipping...${RESET}"
+                sudo mysqldump "$PROJ_DB" > /var/www/html/$FOLDER_NAME/database_backup.sql
+                
+                if [ $? -ne 0 ]; then
+                    echo -e "${RED}[-] Failed to export database! Check if the name is correct.${RESET}"
+                    sudo rm -f /var/www/html/$FOLDER_NAME/database_backup.sql
+                    read -p "Press Enter to return..."
+                    continue
+                fi
+
+                cd /var/www/html/$FOLDER_NAME && sudo zip -r -q /tmp/$BACKUP_NAME .
+                echo -e "${GREEN}[*] Uploading to GDrive...${RESET}"
+                rclone copy /tmp/$BACKUP_NAME gdrive:Server_Backups/
+                
+                sudo rm -f /var/www/html/$FOLDER_NAME/database_backup.sql /tmp/$BACKUP_NAME
+                echo -e "${GREEN}[+] Backup Successful!${RESET}"
+            else
+                echo -e "${RED}[-] Folder not found!${RESET}"
+            fi
+            read -p "Press Enter to return..."
+            ;;
+
+        7)
+            echo -e "\n${RED}[*] DELETE A PROJECT${RESET}"
+            ls -d /var/www/html/*/ | awk -F/ '{print "- " $(NF-1)}' 2>/dev/null
+            read -p "Enter folder to DELETE: " DEL_DIR
+            if [ -d "/var/www/html/$DEL_DIR" ]; then
+                read -p "Type 'YES' to confirm: " CONFIRM
+                if [ "$CONFIRM" == "YES" ]; then
+                    sudo rm -rf /var/www/html/$DEL_DIR
+                    echo -e "${GREEN}[+] Project deleted!${RESET}"
+                fi
+            else
+                echo -e "${RED}[-] Folder not found!${RESET}"
+            fi
+            read -p "Press Enter to return..."
+            ;;
+
+        8)
+            echo -e "\n${YELLOW}[*] INSTALL & SETUP RCLONE${RESET}"
+            rclone config
+            read -p "Press Enter to return..."
+            ;;
+
+        9)
+            echo -e "\n${YELLOW}[*] ADD SECURITY${RESET}"
+            sudo apt-get update -y && sudo apt-get install fail2ban -y
+            sudo systemctl enable fail2ban && sudo systemctl start fail2ban
+            echo -e "${GREEN}[+] Protected!${RESET}"
+            read -p "Press Enter to return..."
+            ;;
+
+        # 🚀 FIXED OPTION 10: Nightly Backup (Separate DB and File Zip)
+        10)
+            echo -e "\n${YELLOW}[*] AUTO SET NIGHTLY BACKUP (11:00 PM)${RESET}"
+            cat << 'BACKUP_EOF' > /root/nightly_master_backup.sh
+#!/bin/bash
+DATE=$(date +"%d-%b-%Y")
+# Backup full server DB separately
+sudo mysqldump --all-databases > /tmp/All_Databases_Nightly_${DATE}.sql
+rclone copy /tmp/All_Databases_Nightly_${DATE}.sql gdrive:Server_Backups/Auto_Nightly/
+rm -f /tmp/All_Databases_Nightly_${DATE}.sql
+
+# Backup files only for each project
+for dir in /var/www/html/*/; do
+    PROJ_NAME=$(basename "$dir")
+    ZIP_NAME="${PROJ_NAME}_FilesOnly_AutoBackup_${DATE}.zip"
+    cd "$dir" && sudo zip -r -q /tmp/$ZIP_NAME .
+    rclone copy /tmp/$ZIP_NAME gdrive:Server_Backups/Auto_Nightly/
+    rm -f /tmp/$ZIP_NAME
+done
+BACKUP_EOF
+            sudo chmod +x /root/nightly_master_backup.sh
+            CRON_JOB="0 23 * * * /root/nightly_master_backup.sh > /root/backup_log.txt 2>&1"
+            (crontab -l 2>/dev/null | grep -v "nightly_master_backup.sh"; echo "$CRON_JOB") | crontab -
+            echo -e "${GREEN}[+] Daily Auto Backup scheduled at 11:00 PM!${RESET}"
+            read -p "Press Enter to return..."
+            ;;
+
+        11)
+            echo -e "\n${YELLOW}[*] AUTO SSL SETUP${RESET}"
+            read -p "Domain Name (e.g. example.com): " SSL_DOMAIN
+            read -p "Email: " SSL_EMAIL
+            sudo apt install certbot python3-certbot-nginx -y >/dev/null 2>&1
+            sudo certbot --nginx -d $SSL_DOMAIN -d www.$SSL_DOMAIN --non-interactive --agree-tos -m $SSL_EMAIL --redirect
+            read -p "Press Enter to return..."
+            ;;
+
+        12)
+            echo -e "\n${MAGENTA}[*] CHANGE DB ADMIN PASSWORD${RESET}"
+            read -p "Enter Database Name (e.g. codexaum_erp): " TARGET_DB
+            read -p "Enter Table Name (e.g. schools or users): " TARGET_TBL
+            read -p "Enter Target User ID/Email/Mobile: " TARGET_ID
+            read -p "Enter New Password: " NEW_PASS
+            sudo mysql -e "USE \`$TARGET_DB\`; UPDATE \`$TARGET_TBL\` SET password='$NEW_PASS' WHERE email='$TARGET_ID' OR admin_mobile='$TARGET_ID' OR id='$TARGET_ID';" 2>/dev/null
+            if [ $? -eq 0 ]; then
+                echo -e "${GREEN}[+] Password Updated!${RESET}"
+            else
+                echo -e "${RED}[-] Failed. Check DB or Table Name.${RESET}"
+            fi
+            read -p "Press Enter to return..."
+            ;;
+
+        13)
+            echo -e "\n${YELLOW}[*] 📝 FILE EXPLORER & EDITOR${RESET}"
+            cd /var/www/html/ || continue
+            shopt -s nullglob
+            PROJ_ARRAY=(*/)
+            shopt -u nullglob
+            if [ ${#PROJ_ARRAY[@]} -eq 0 ]; then
+                echo -e "${RED}[-] No projects found.${RESET}"
+                read -p "Press Enter to return..."
+                continue
+            fi
+            echo -e "${YELLOW}Available Projects:${RESET}"
+            for i in "${!PROJ_ARRAY[@]}"; do
+                PROJ_NAME=$(basename "${PROJ_ARRAY[$i]}")
+                echo -e "${CYAN}$((i+1))) 📁 $PROJ_NAME${RESET}"
+            done
+            echo -e "${RED}0) 🔙 Go Back${RESET}"
+
+            read -p "Select a project [0-${#PROJ_ARRAY[@]}]: " P_CHOICE
+            P_CHOICE=$(echo "$P_CHOICE" | tr -cd '0-9')
+            if [[ "$P_CHOICE" == "0" ]]; then continue; fi
+            if [[ -n "$P_CHOICE" ]] && [[ "$P_CHOICE" -gt 0 && "$P_CHOICE" -le "${#PROJ_ARRAY[@]}" ]]; then
+                SEL_PROJ=$(basename "${PROJ_ARRAY[$((P_CHOICE-1))]}")
+                EXPLORE_DIR="/var/www/html/$SEL_PROJ"
+                while true; do
+                    clear
+                    echo -e "${YELLOW}=====================================================${RESET}"
+                    echo -e "${MAGENTA}   📂 EXPLORING: $EXPLORE_DIR ${RESET}"
+                    echo -e "${YELLOW}=====================================================${RESET}"
+                    cd "$EXPLORE_DIR" || break
+                    shopt -s dotglob nullglob
+                    ITEMS=(*)
+                    shopt -u dotglob nullglob
+                    for j in "${!ITEMS[@]}"; do
+                        ITEM="${ITEMS[$j]}"
+                        if [ -d "$ITEM" ]; then
+                            echo -e "${BLUE}$((j+1))) 📁 $ITEM/ ${RESET}"
+                        else
+                            echo -e "${GREEN}$((j+1))) 📄 $ITEM ${RESET}"
+                        fi
+                    done
+                    echo -e "${BLUE}-----------------------------------------------------${RESET}"
+                    echo -e "${CYAN}N) ➕ Create New File Here${RESET}"
+                    echo -e "${RED}0) 🔙 Go Back / Exit${RESET}"
+
+                    read -p "Select [0-${#ITEMS[@]} or N to Create]: " F_CHOICE
+                    F_CHOICE=$(echo "$F_CHOICE" | tr -d '\r ')
+                    if [[ "$F_CHOICE" == "0" ]]; then
+                        if [[ "$EXPLORE_DIR" == "/var/www/html/$SEL_PROJ" ]]; then break; else EXPLORE_DIR=$(dirname "$EXPLORE_DIR"); fi
+                    elif [[ "$F_CHOICE" == "N" || "$F_CHOICE" == "n" ]]; then
+                        read -p "Enter new file name (e.g. index.php): " NEW_FILE
+                        if [[ "$NEW_FILE" != *.* ]]; then NEW_FILE="$NEW_FILE.php"; fi
+                        touch "$EXPLORE_DIR/$NEW_FILE" && nano "$EXPLORE_DIR/$NEW_FILE"
+                        sudo chown $USER:www-data "$EXPLORE_DIR/$NEW_FILE"
+                    elif [[ "$F_CHOICE" =~ ^[0-9]+$ ]] && [[ "$F_CHOICE" -gt 0 && "$F_CHOICE" -le "${#ITEMS[@]}" ]]; then
+                        SEL_ITEM="${ITEMS[$((F_CHOICE-1))]}"
+                        if [ -d "$SEL_ITEM" ]; then EXPLORE_DIR="$EXPLORE_DIR/$SEL_ITEM"; elif [ -f "$SEL_ITEM" ]; then nano "$SEL_ITEM"; fi
+                    fi
+                done
+            fi
+            ;;
+
+        14)
+            while true; do
+                clear
+                echo -e "\n${YELLOW}=====================================================${RESET}"
+                echo -e "${MAGENTA}[*] 🗄️ MYSQL DB MANAGER (Smart Interactive View)${RESET}"
+                echo -e "${YELLOW}=====================================================${RESET}"
+                DBS=$(sudo mysql -N -e "SHOW DATABASES" | grep -vE '^(information_schema|performance_schema|mysql|sys)$')
+                if [ -z "$DBS" ]; then
+                    echo -e "${RED}No custom databases found.${RESET}"
+                    read -p "Press Enter to return..."
+                    break
+                fi
+                declare -a TABLE_LIST
+                declare -a DB_LIST_FOR_TABLE
+                COUNTER=1
+                echo -e "${CYAN}Available Databases & Tables:${RESET}"
+                for db in $DBS; do
+                    echo -e "📂 ${GREEN}$db${RESET}"
+                    TABLES=$(sudo mysql -N -e "SHOW TABLES IN \`$db\`;")
+                    if [ -z "$TABLES" ]; then
+                        echo -e "   └── ${RED}(No tables found)${RESET}"
+                    else
+                        for tb in $TABLES; do
+                            echo -e "   ├── ${YELLOW}[$COUNTER]${RESET} 📄 $tb"
+                            TABLE_LIST[$COUNTER]="$tb"
+                            DB_LIST_FOR_TABLE[$COUNTER]="$db"
+                            COUNTER=$((COUNTER+1))
+                        done
+                    fi
+                done
+                echo -e "${BLUE}-----------------------------------------------------${RESET}"
+                echo -e "${CYAN}N) ➕ Create New Database${RESET}"
+                echo -e "${RED}D) 🗑️ Drop/Delete a Database${RESET}"
+                echo -e "${MAGENTA}S) 📜 VIEW FULL SCHEMA FOR AI (Copy & Paste to AI)${RESET}"
+                echo -e "${YELLOW}👉 Type a ${GREEN}Table Number [1-$((COUNTER-1))]${YELLOW} to Manage its Data & Structure${RESET}"
+                echo -e "${RED}0) 🔙 Go Back to Main Menu${RESET}"
+
+                read -p "Enter Choice: " DB_CH
+                DB_CH=$(echo "$DB_CH" | tr -d '\r ')
+
+                if [[ "$DB_CH" == "0" ]]; then
+                    break
+                elif [[ "$DB_CH" == "N" || "$DB_CH" == "n" ]]; then
+                    read -p "Enter new database name: " NEW_DB
+                    sudo mysql -e "CREATE DATABASE IF NOT EXISTS \`$NEW_DB\`;"
+                    sudo mysql -e "GRANT ALL PRIVILEGES ON \`$NEW_DB\`.* TO 'admin'@'localhost'; FLUSH PRIVILEGES;"
+                    echo -e "${GREEN}[+] Database '$NEW_DB' created successfully!${RESET}"
+                    read -p "Press Enter to continue..."
+                
+                elif [[ "$DB_CH" == "S" || "$DB_CH" == "s" ]]; then
+                    echo -e "\n${YELLOW}--- 📜 AI-Friendly Schema Generator ---${RESET}"
+                    read -p "Enter Database Name (from the list above): " SCHEMA_DB
+                    DB_EXISTS=$(sudo mysql -N -e "SHOW DATABASES LIKE '$SCHEMA_DB';")
+                    if [ -n "$DB_EXISTS" ]; then
+                        clear
+                        echo -e "${GREEN}=====================================================${RESET}"
+                        echo -e "${MAGENTA} 🤖 DATABASE SCHEMA FOR AI: $SCHEMA_DB ${RESET}"
+                        echo -e "${GREEN}=====================================================${RESET}"
+                        
+                        sudo mysql -N -e "SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = '$SCHEMA_DB' ORDER BY TABLE_NAME;" | awk '{
+                            if ($1 != prev) {
+                                print "\nTable: " $1;
+                                prev=$1;
+                            }
+                            print "  - " $2 " (" $3 ")";
+                        }'
+                        
+                        echo -e "\n${YELLOW}=====================================================${RESET}"
+                        echo -e "${CYAN}💡 You can now easily copy the text above and paste it to ChatGPT/Gemini!${RESET}"
+                        echo -e "${YELLOW}=====================================================${RESET}"
+                    else
+                        echo -e "${RED}[-] Database not found! Make sure you typed the exact name.${RESET}"
+                    fi
+                    read -p "Press Enter to continue..."
+
+                elif [[ "$DB_CH" == "D" || "$DB_CH" == "d" ]]; then
+                    read -p "Enter database name to DELETE: " DEL_DB
+                    read -p "Type 'YES' to confirm: " CONFIRM
+                    if [ "$CONFIRM" == "YES" ]; then
+                        sudo mysql -e "DROP DATABASE IF EXISTS \`$DEL_DB\`;"
+                        echo -e "${GREEN}[+] Database '$DEL_DB' deleted!${RESET}"
+                    fi
+                    read -p "Press Enter to continue..."
+                elif [[ "$DB_CH" =~ ^[0-9]+$ ]] && [[ "$DB_CH" -gt 0 && "$DB_CH" -lt "$COUNTER" ]]; then
+                    TARGET_DB="${DB_LIST_FOR_TABLE[$DB_CH]}"
+                    TARGET_TABLE="${TABLE_LIST[$DB_CH]}"
+                    while true; do
+                        clear
+                        echo -e "\n${MAGENTA}⚙️ Managing Table: ${CYAN}$TARGET_DB.$TARGET_TABLE${RESET}"
+                        echo -e "${BLUE}=====================================================${RESET}"
+                        echo -e "${GREEN}1) 👀 View Data (Show Rows)${RESET}"
+                        echo -e "${GREEN}2) 📐 View Structure (Columns & Types)${RESET}"
+                        echo -e "${CYAN}3) ➕ Insert New Data (Add a Row)${RESET}"
+                        echo -e "${YELLOW}4) ✏️ Edit/Update Data (By Target Column)${RESET}"
+                        echo -e "${RED}5) 🗑️ Delete a Row${RESET}"
+                        echo -e "${BLUE}-----------------------------------------------------${RESET}"
+                        echo -e "${CYAN}6) ➕ Add a New Column (VARCHAR)${RESET}"
+                        echo -e "${YELLOW}7) ✏️ Rename this Table${RESET}"
+                        echo -e "${RED}8) 🗑️ Delete (Drop) this Table${RESET}"
+                        echo -e "${BLUE}0) 🔙 Go Back to Database List${RESET}"
+
+                        read -p "Select Action [0-8]: " TBL_ACT
+                        TBL_ACT=$(echo "$TBL_ACT" | tr -cd '0-9')
+
+                        case $TBL_ACT in
+                            1) echo -e "\n${YELLOW}Showing Data for $TARGET_TABLE (Limit 50)...${RESET}"; sudo mysql -t -e "SELECT * FROM \`$TARGET_DB\`.\`$TARGET_TABLE\` LIMIT 50;" ;;
+                            2) echo -e "\n${YELLOW}Table Structure for $TARGET_TABLE...${RESET}"; sudo mysql -t -e "DESCRIBE \`$TARGET_DB\`.\`$TARGET_TABLE\`;" ;;
+                            3)
+                                echo -e "\n${CYAN}--- Insert New Row ---${RESET}"
+                                COLS=$(sudo mysql -N -e "SHOW COLUMNS FROM \`$TARGET_DB\`.\`$TARGET_TABLE\`" | awk '{print $1}')
+                                INSERT_COLS=""
+                                INSERT_VALS=""
+                                for col in $COLS; do
+                                    read -p "Enter value for '$col' (Leave blank for Auto/NULL): " VAL
+                                    if [ -n "$VAL" ]; then INSERT_COLS="$INSERT_COLS\`$col\`, "; INSERT_VALS="$INSERT_VALS'$VAL', "; fi
+                                done
+                                if [ -n "$INSERT_COLS" ]; then
+                                    INSERT_COLS=${INSERT_COLS%, }; INSERT_VALS=${INSERT_VALS%, }
+                                    sudo mysql -e "INSERT INTO \`$TARGET_DB\`.\`$TARGET_TABLE\` ($INSERT_COLS) VALUES ($INSERT_VALS);"
+                                    if [ $? -eq 0 ]; then echo -e "${GREEN}[+] Data Inserted Successfully!${RESET}"; else echo -e "${RED}[-] Failed to insert data.${RESET}"; fi
+                                else echo -e "${RED}[!] No data provided. Cancelled.${RESET}"; fi
+                                ;;
+                            4)
+                                echo -e "\n${YELLOW}--- Edit Existing Data ---${RESET}"
+                                read -p "Enter the TARGET COLUMN to match (e.g., id): " W_COL
+                                read -p "Enter the TARGET VALUE (e.g., 5): " W_VAL
+                                read -p "Enter the COLUMN TO UPDATE (e.g., status): " U_COL
+                                read -p "Enter the NEW VALUE: " U_VAL
+                                sudo mysql -e "UPDATE \`$TARGET_DB\`.\`$TARGET_TABLE\` SET \`$U_COL\`='$U_VAL' WHERE \`$W_COL\`='$W_VAL';"
+                                if [ $? -eq 0 ]; then echo -e "${GREEN}[+] Row Updated Successfully!${RESET}"; else echo -e "${RED}[-] Failed to update data.${RESET}"; fi
+                                ;;
+                            5)
+                                echo -e "\n${RED}--- Delete a Row ---${RESET}"
+                                read -p "Enter the COLUMN NAME to match (e.g., id): " D_COL
+                                read -p "Enter the VALUE to delete (e.g., 5): " D_VAL
+                                read -p "Are you sure you want to delete where $D_COL = $D_VAL? (y/n): " DEL_CONF
+                                if [[ "$DEL_CONF" == "y" || "$DEL_CONF" == "Y" ]]; then sudo mysql -e "DELETE FROM \`$TARGET_DB\`.\`$TARGET_TABLE\` WHERE \`$D_COL\`='$D_VAL';"; echo -e "${GREEN}[+] Row Deleted!${RESET}"; fi
+                                ;;
+                            6)
+                                read -p "Enter NEW COLUMN NAME (e.g., photo, status): " NEW_COL
+                                if [ -n "$NEW_COL" ]; then sudo mysql -e "ALTER TABLE \`$TARGET_DB\`.\`$TARGET_TABLE\` ADD \`$NEW_COL\` VARCHAR(255) NULL;"; echo -e "${GREEN}[+] Column '$NEW_COL' added to $TARGET_TABLE!${RESET}"; fi
+                                ;;
+                            7)
+                                read -p "Enter NEW TABLE NAME: " NEW_TB_NAME
+                                if [ -n "$NEW_TB_NAME" ]; then sudo mysql -e "RENAME TABLE \`$TARGET_DB\`.\`$TARGET_TABLE\` TO \`$TARGET_DB\`.\`$NEW_TB_NAME\`;"; echo -e "${GREEN}[+] Table renamed to '$NEW_TB_NAME'!${RESET}"; TARGET_TABLE="$NEW_TB_NAME"; fi
+                                ;;
+                            8)
+                                read -p "Type 'YES' to DROP table '$TARGET_TABLE': " CONFIRM_TB
+                                if [ "$CONFIRM_TB" == "YES" ]; then sudo mysql -e "DROP TABLE \`$TARGET_DB\`.\`$TARGET_TABLE\`;"; echo -e "${GREEN}[+] Table '$TARGET_TABLE' deleted!${RESET}"; break; fi
+                                ;;
+                            0) break ;;
+                            *) echo -e "${RED}Invalid Action!${RESET}" ;;
+                        esac
+                        read -p "Press Enter to continue..."
+                    done
+                else
+                    echo -e "${RED}Invalid Option!${RESET}"
+                    sleep 1
+                fi
+            done
+            ;;
+
+        15)
+            echo -e "\n${MAGENTA}[*] 🚑 1-CLICK DISASTER RECOVERY (Auto Backup Restore)${RESET}"
+            read -p "Enter GDrive Share Link of your ZIP backup: " LINK
+            FILE_ID=$(echo "$LINK" | sed -E 's/.*\/d\/([a-zA-Z0-9_-]+).*/\1/')
+            if [ -n "$FILE_ID" ]; then
+                read -p "Enter Target Project Folder (e.g. codexaum): " NEW_DIR
+                sudo mkdir -p /var/www/html/$NEW_DIR
+
+                gdrive_download "$FILE_ID" "/tmp/disaster_recovery.zip"
+                if [ $? -ne 0 ]; then
+                    echo -e "${RED}[-] Download failed. Make sure Drive link is set to 'Anyone with the link'.${RESET}"
+                    read -p "Press Enter to return..."
+                    continue
+                fi
+
+                echo -e "${GREEN}[*] Extracting files...${RESET}"
+                sudo unzip -q -o /tmp/disaster_recovery.zip -d /var/www/html/$NEW_DIR
+                sudo rm -f /tmp/disaster_recovery.zip
+                sudo chown -R $USER:www-data /var/www/html/$NEW_DIR
+                sudo chmod -R 775 /var/www/html/$NEW_DIR
+
+                if [ -f "/var/www/html/$NEW_DIR/database_backup.sql" ]; then
+                    read -p "Enter the Database Name to Restore Into (e.g. codexaum_erp): " TARGET_DB
+                    echo -e "${GREEN}[*] Creating Database & Applying 'DEFINER' fixes...${RESET}"
+                    sudo mysql -e "CREATE DATABASE IF NOT EXISTS \`$TARGET_DB\`;"
+                    sudo mysql -e "GRANT ALL PRIVILEGES ON \`$TARGET_DB\`.* TO 'admin'@'localhost'; FLUSH PRIVILEGES;"
+                    sudo sed -i '/^\/\*/s/DEFINER=[^*]*\*/\*/g' /var/www/html/$NEW_DIR/database_backup.sql
+                    sudo sed -i '/^CREATE/s/DEFINER=[^ ]* //g' /var/www/html/$NEW_DIR/database_backup.sql
+                    sudo sed -i '/^CREATE/s/DEFINER=\`[^\`]*\`@\`[^\`]*\` //g' /var/www/html/$NEW_DIR/database_backup.sql
+                    echo -e "${YELLOW}[*] Merging DB with --force...${RESET}"
+                    sudo mysql --force "$TARGET_DB" < /var/www/html/$NEW_DIR/database_backup.sql 2>/dev/null
+                    echo -e "${GREEN}[+] Database Successfully Restored!${RESET}"
+                    sudo rm -f /var/www/html/$NEW_DIR/database_backup.sql
+                fi
+                echo -e "${GREEN}[+] Disaster Recovery Complete! Project is LIVE again.${RESET}"
+            else
+                echo -e "${RED}[-] Invalid Link!${RESET}"
+            fi
+            read -p "Press Enter to return..."
+            ;;
+
+        16)
+            echo -e "\n${YELLOW}[*] 🕵️‍♂️ DB CREDENTIAL FINDER${RESET}"
+            ls -d /var/www/html/*/ | awk -F/ '{print "- " $(NF-1)}' 2>/dev/null
+            read -p "Enter project folder name to search: " PROJ_DIR
+            if [ -d "/var/www/html/$PROJ_DIR" ]; then
+                echo -e "${GREEN}[*] Scanning config files...${RESET}\n"
+                grep -riE 'DB_HOST|DB_USER|DB_PASS|DB_NAME|\$db_name|\$username' /var/www/html/$PROJ_DIR/ | grep -v 'vendor' | head -n 15
+            else
+                echo -e "${RED}[-] Folder not found!${RESET}"
+            fi
+            read -p "Press Enter to return..."
+            ;;
+
+        0)
+            clear
+            echo -e "${GREEN}Exiting Master Tool. Server is safe. Have a great day, Prodip Bandhu!${RESET}"
+            exit 0
+            ;;
+
+        *)
+            echo -e "${RED}Invalid Option!${RESET}"
+            sleep 1
+            ;;
+    esac
+done
