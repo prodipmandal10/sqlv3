@@ -33,15 +33,12 @@ fi
 
 # ─────────────────────────────────────────────────────────
 # 🔧 SHARED HELPER: Download from GDrive with 3-step fallback
-# Usage: gdrive_download "$FILE_ID" "/tmp/output.zip"
-# Returns 0 on success, 1 on failure
 # ─────────────────────────────────────────────────────────
 gdrive_download() {
     local FID="$1"
     local OUT="$2"
     sudo rm -f "$OUT"
 
-    # ── Step 1: gdown --id (classic)
     echo -e "${CYAN}[*] Attempt 1: gdown --id ...${RESET}"
     gdown --id "$FID" -O "$OUT" 2>/dev/null
     if unzip -t "$OUT" &>/dev/null; then
@@ -50,7 +47,6 @@ gdrive_download() {
     fi
     sudo rm -f "$OUT"
 
-    # ── Step 2: gdown with full URL (confirmed working by user ✅)
     echo -e "${YELLOW}[*] Attempt 2: gdown with full URL...${RESET}"
     gdown "https://drive.google.com/uc?id=$FID" -O "$OUT" 2>/dev/null
     if unzip -t "$OUT" &>/dev/null; then
@@ -59,7 +55,6 @@ gdrive_download() {
     fi
     sudo rm -f "$OUT"
 
-    # ── Step 3: wget confirm=t fallback
     echo -e "${YELLOW}[*] Attempt 3: wget confirm=t fallback...${RESET}"
     sudo wget -qO "$OUT" "https://docs.google.com/uc?export=download&confirm=t&id=$FID"
     if unzip -t "$OUT" &>/dev/null; then
@@ -74,7 +69,6 @@ gdrive_download() {
 
 # ─────────────────────────────────────────────────────────
 # 🔧 SHARED HELPER: Process ZIP → Extract + DB Restore
-# Usage: process_project_zip "/tmp/file.zip" "folder_name"
 # ─────────────────────────────────────────────────────────
 process_project_zip() {
     local ZIP_PATH="$1"
@@ -212,6 +206,7 @@ while true; do
             read -p "Press Enter to return..."
             ;;
 
+        # 🚀 FIXED OPTION 2: DOMAIN SETUP WITH .ENV SECURITY AND EXTENSIONLESS PHP
         2)
             echo -e "\n${YELLOW}[*] SETUP DOMAIN (Link Domain to Project)${RESET}"
             ls -d /var/www/html/*/ | awk -F/ '{print "- " $(NF-1)}' 2>/dev/null || echo "No projects found!"
@@ -225,6 +220,7 @@ while true; do
                 CONF_FILE="/etc/nginx/sites-available/${DOMAIN_NAME}"
                 PHP_SOCK=$(find /var/run/php/ -name "php*-fpm.sock" | head -n 1)
 
+                # Applying Nginx configuration with .env protection
                 sudo bash -c "cat > $CONF_FILE" <<EOF
 server {
     listen 80;
@@ -232,11 +228,26 @@ server {
     root /var/www/html/$PROJ_DIR;
     index index.php index.html;
 
-    location / {
-        try_files \$uri \$uri/ /index.php?\$query_string;
+    # 🛡️ 100% Hacker Proof: Hidden Files (.env, .git) Block
+    location ~ /\. {
+        deny all;
+        access_log off;
+        log_not_found off;
     }
 
-    location ~ \.php$ {
+    location / {
+        try_files \$uri \$uri/ @extensionless_php;
+    }
+
+    # 💥 Extensionless PHP block
+    location @extensionless_php {
+        if (-f \$document_root\$uri.php) {
+            rewrite ^(.*)\$ \$1.php last;
+        }
+        rewrite ^ /index.php?\$query_string last;
+    }
+
+    location ~ \.php\$ {
         include snippets/fastcgi-php.conf;
         fastcgi_pass unix:$PHP_SOCK;
     }
@@ -245,6 +256,7 @@ EOF
                 sudo ln -sf /etc/nginx/sites-available/${DOMAIN_NAME} /etc/nginx/sites-enabled/
                 sudo systemctl restart nginx
                 echo -e "${GREEN}[+] Domain '${DOMAIN_NAME}' successfully linked to '${PROJ_DIR}'!${RESET}"
+                echo -e "${GREEN}[+] Security: .env files are now blocked and extensionless URLs are active!${RESET}"
 
                 if [[ "$DOMAIN_NAME" == *".local"* || "$DOMAIN_NAME" == *".test"* ]]; then
                     echo -e "${YELLOW}👉 Remember to add '${DOMAIN_NAME}' to your Windows 'hosts' file!${RESET}"
@@ -372,7 +384,6 @@ EOF
             read -p "Press Enter to return..."
             ;;
 
-        # 🚀 FIXED OPTION 6: Specific DB Backup
         6)
             echo -e "\n${YELLOW}[*] BACKUP SPECIFIC PROJECT TO GDRIVE${RESET}"
             ls -d /var/www/html/*/ | awk -F/ '{print "- " $(NF-1)}' 2>/dev/null
@@ -442,7 +453,6 @@ EOF
             read -p "Press Enter to return..."
             ;;
 
-        # 🚀 FIXED OPTION 10: Nightly Backup (Separate DB and File Zip)
         10)
             echo -e "\n${YELLOW}[*] AUTO SET NIGHTLY BACKUP (11:00 PM)${RESET}"
             cat << 'BACKUP_EOF' > /root/nightly_master_backup.sh
