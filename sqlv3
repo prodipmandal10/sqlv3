@@ -397,7 +397,7 @@ EOF
                 BACKUP_NAME="${FOLDER_NAME}_Backup_$DATE.zip"
                 
                 echo -e "${GREEN}[*] Exporting Database ('$PROJ_DB') and Zipping...${RESET}"
-                sudo mysqldump "$PROJ_DB" > /var/www/html/$FOLDER_NAME/database_backup.sql
+                sudo mysqldump -u root -p'Pallabi@##1' "$PROJ_DB" > /var/www/html/$FOLDER_NAME/database_backup.sql
                 
                 if [ $? -ne 0 ]; then
                     echo -e "${RED}[-] Failed to export database! Check if the name is correct.${RESET}"
@@ -453,7 +453,7 @@ EOF
             cat << 'BACKUP_EOF' > /root/nightly_master_backup.sh
 #!/bin/bash
 DATE=$(date +"%d-%b-%Y")
-sudo mysqldump --all-databases > /tmp/All_Databases_Nightly_${DATE}.sql
+sudo mysqldump -u root -p'Pallabi@##1' --all-databases > /tmp/All_Databases_Nightly_${DATE}.sql
 rclone copy /tmp/All_Databases_Nightly_${DATE}.sql gdrive:Server_Backups/Auto_Nightly/
 rm -f /tmp/All_Databases_Nightly_${DATE}.sql
 
